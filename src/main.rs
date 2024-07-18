@@ -6,7 +6,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
-use color_eyre::eyre::{eyre, Context, Result};
+use color_eyre::eyre::{eyre, Context, Ok, Result};
 use colored::Colorize;
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -20,8 +20,12 @@ struct Cli {
     command: Commands,
 
     /// osmosis home directory, defaulted to ~/.osmosisd
-    #[arg(short, long)]
+    #[arg(long)]
     home_dir: Option<PathBuf>,
+
+    /// osmosis binary
+    #[arg(long, default_value = "osmosisd")]
+    osmosis_bin: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
@@ -65,6 +69,8 @@ async fn run_cmd(cli: Cli) -> Result<()> {
         .home_dir
         .unwrap_or_else(|| PathBuf::from(format!("{}/.osmosisd", std::env::var("HOME").unwrap())));
 
+    let osmosisd = cli.osmosis_bin;
+
     match &cli.command {
         Commands::DownloadMainnetState => {
             // Remove existing OSMOSIS_HOME directory if it exists
@@ -83,7 +89,7 @@ async fn run_cmd(cli: Cli) -> Result<()> {
             spinner! {
                 "Initializing osmosis chain...",
                 "✓ Initialized osmosis chain.",
-                Command::new("osmosisd")
+                Command::new(osmosisd)
                     .arg("init")
                     .arg("test")
                     .arg("--chain-id")
@@ -188,8 +194,7 @@ async fn run_cmd(cli: Cli) -> Result<()> {
                 &format!("✓ Copied {} to {}.", osmosis_home.display(), backup_path.display()),
                 {
                     let osmosis_home_path = PathBuf::from(osmosis_home.clone());
-                    let options = fs_extra::dir::CopyOptions::new()
-                        .copy_inside(true);
+                    let options = fs_extra::dir::CopyOptions::new().copy_inside(true);
 
                     fs_extra::dir::copy(&osmosis_home_path, &backup_path, &options).wrap_err("Failed to copy home to backup")
                 }
