@@ -18,6 +18,10 @@ use tempfile;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// osmosis home directory, defaulted to ~/.osmosisd
+    #[arg(short, long)]
+    home_dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -25,8 +29,15 @@ enum Commands {
     /// Download mainnet state
     DownloadMainnetState,
 
-    /// Backup osmosis state to a file
+    /// Backup current osmosis state
     Backup {
+        /// Path to backup directory, defaults to $HOME/.osmosisd_bak
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Restore osmosis state from a backup
+    Restore {
         /// Path to backup directory, defaults to $HOME/.osmosisd_bak
         #[arg(short, long)]
         path: Option<PathBuf>,
@@ -50,7 +61,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run_cmd(cli: Cli) -> Result<()> {
-    let osmosis_home = format!("{}/.osmosisd", std::env::var("HOME").unwrap());
+    let osmosis_home = cli
+        .home_dir
+        .unwrap_or_else(|| PathBuf::from(format!("{}/.osmosisd", std::env::var("HOME").unwrap())));
 
     match &cli.command {
         Commands::DownloadMainnetState => {
@@ -61,7 +74,7 @@ async fn run_cmd(cli: Cli) -> Result<()> {
                     "✓ Removed existing OSMOSIS_HOME directory.",
                     std::fs::remove_dir_all(&osmosis_home).wrap_err(format!(
                         "Failed to remove existing OSMOSIS_HOME directory: {}",
-                        osmosis_home
+                        osmosis_home.display()
                     ))?
                 };
             }
@@ -74,7 +87,7 @@ async fn run_cmd(cli: Cli) -> Result<()> {
                     .arg("init")
                     .arg("test")
                     .arg("--chain-id")
-                    .arg("testing")
+                    .arg("edgenet")
                     .arg("--home")
                     .arg(&osmosis_home)
                     .stderr(std::process::Stdio::null())
@@ -93,7 +106,7 @@ async fn run_cmd(cli: Cli) -> Result<()> {
                         .await
                         .wrap_err("Failed to download genesis file")?;
 
-                    std::fs::write(format!("{}/config/genesis.json", osmosis_home), genesis_content)
+                    std::fs::write(osmosis_home.join("config").join("genesis.json"), genesis_content)
                         .wrap_err("Failed to write genesis file")?;
                 }
             };
@@ -171,14 +184,29 @@ async fn run_cmd(cli: Cli) -> Result<()> {
 
             // Copy home to backup
             spinner! {
-                &format!("Copying {} to {}...", &osmosis_home, backup_path.display()),
-                &format!("✓ Copied {} to {}.", &osmosis_home, backup_path.display()),
+                &format!("Copying {} to {}...", osmosis_home.display(), backup_path.display()),
+                &format!("✓ Copied {} to {}.", osmosis_home.display(), backup_path.display()),
                 {
                     let osmosis_home_path = PathBuf::from(osmosis_home.clone());
                     let options = fs_extra::dir::CopyOptions::new()
                         .copy_inside(true);
 
                     fs_extra::dir::copy(&osmosis_home_path, &backup_path, &options).wrap_err("Failed to copy home to backup")
+                }
+            }?;
+        }
+        Commands::Restore { path } => {
+            let backup_path = path.clone().unwrap_or_else(|| {
+                PathBuf::from(format!("{}/.osmosisd_bak", std::env::var("HOME").unwrap()))
+            });
+
+            // Copy backup to home
+            spinner! {
+                &format!("Copying {} to {}...", backup_path.display(), osmosis_home.display()),
+                &format!("✓ Copied {} to {}.", backup_path.display(), osmosis_home.display()),
+                {
+                    let options = fs_extra::dir::CopyOptions::new().copy_inside(true);
+                    fs_extra::dir::copy(&backup_path, &osmosis_home, &options).wrap_err("Failed to copy backup to home")
                 }
             }?;
         }
