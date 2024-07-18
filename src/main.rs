@@ -25,7 +25,7 @@ struct Cli {
 
     /// osmosis binary
     #[arg(long, default_value = "osmosisd")]
-    osmosis_bin: PathBuf,
+    osmosisd_bin: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
@@ -46,6 +46,27 @@ enum Commands {
         #[arg(short, long)]
         path: Option<PathBuf>,
     },
+
+    /// Start the node and sync to the latest block
+    StartSync {
+        /// Stop the node on first indexed block events
+        #[arg(short, long)]
+        stop_on_first_indexed_block_events: bool,
+    },
+
+    /// Start osmosis in place testnet
+    StartInPlaceTestnet {
+        /// Optional upgrade handler, if set, the chain will be marked to run the upgrade handler when running with the right binary
+        #[arg(long)]
+        upgrade_handler: Option<String>,
+
+        /// Upgraded binary used to start the chain with upgrade handler triggered
+        #[arg(long)]
+        upgraded_binary: Option<PathBuf>,
+    },
+
+    /// Start a standalone node
+    StartStandalone,
 }
 
 const LATEST_SNAPSHOT_FETCH_URL: &str = "https://snapshots.osmosis.zone/latest";
@@ -56,20 +77,20 @@ const GENESIS_URL: &str =
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    // Check if osmosisd exists
-    if which::which("osmosisd").is_err() {
-        return Err(eyre!("osmosisd not found in PATH"));
-    }
 
     run_cmd(Cli::parse()).await
 }
 
 async fn run_cmd(cli: Cli) -> Result<()> {
+    // Check if osmosisd exists
+    let osmosisd = cli.osmosisd_bin;
+    if which::which(osmosisd.as_os_str()).is_err() {
+        return Err(eyre!("osmosisd not found in PATH"));
+    }
+
     let osmosis_home = cli
         .home_dir
         .unwrap_or_else(|| PathBuf::from(format!("{}/.osmosisd", std::env::var("HOME").unwrap())));
-
-    let osmosisd = cli.osmosis_bin;
 
     match &cli.command {
         Commands::DownloadMainnetState => {
@@ -205,6 +226,15 @@ async fn run_cmd(cli: Cli) -> Result<()> {
                 PathBuf::from(format!("{}/.osmosisd_bak", std::env::var("HOME").unwrap()))
             });
 
+            // Cleanup if osmosis home already exists
+            if osmosis_home.exists() {
+                spinner! {
+                    "Removing existing osmosis home directory...",
+                    "✓ Removed existing osmosis home directory.",
+                    std::fs::remove_dir_all(&osmosis_home).wrap_err("Failed to remove existing osmosis home directory")
+                }?;
+            }
+
             // Copy backup to home
             spinner! {
                 &format!("Copying {} to {}...", backup_path.display(), osmosis_home.display()),
@@ -215,9 +245,100 @@ async fn run_cmd(cli: Cli) -> Result<()> {
                 }
             }?;
         }
+        Commands::StartSync {
+            stop_on_first_indexed_block_events: stop_on_first_commit_synced,
+        } => {
+            // Start osmosisd
+            let mut child = Command::new(osmosisd)
+                .arg("start")
+                .arg("--home")
+                .arg(&osmosis_home)
+                .stdout(std::process::Stdio::piped())
+                .spawn()?;
+
+            if let Some(stdout) = child.stdout.as_mut() {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(stdout);
+                for line in reader.lines() {
+                    let line = line?;
+                    println!("{}", line);
+                    if *stop_on_first_commit_synced && line.contains("indexed block events") {
+                        child.kill()?;
+                        break;
+                    }
+                }
+            }
+
+            child.wait()?;
+        }
+        Commands::StartInPlaceTestnet {
+            upgrade_handler,
+            upgraded_binary,
+        } => {
+            let mut cmd = Command::new(osmosisd);
+            cmd.arg("in-place-testnet")
+                .arg("edgenet")
+                .arg("osmo12smx2wdlyttvyzvzg54y2vnqwq2qjateuf7thj")
+                .arg("--home")
+                .arg(&osmosis_home)
+                .stdout(std::process::Stdio::piped());
+
+            // trigger testnet upgrade if upgrade handler is set
+            if let Some(upgrade_handler) = upgrade_handler {
+                cmd.arg("--trigger-testnet-upgrade").arg(upgrade_handler);
+            }
+
+            let mut child = cmd.spawn()?;
+
+            if let Some(stdout) = child.stdout.as_mut() {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(stdout);
+                for line in reader.lines() {
+                    let line = line?;
+                    println!("{}", line);
+                    if line.contains("CONSENSUS FAILURE!!!") {
+                        child.kill()?;
+                        break;
+                    }
+                }
+            }
+
+            child.wait()?;
+
+            if let Some(upgraded_binary) = upgraded_binary {
+                start_node_no_peers(
+                    &mut Command::new(upgraded_binary.as_os_str()),
+                    &osmosis_home,
+                )
+                .spawn()?
+                .wait()?;
+            }
+        }
+        Commands::StartStandalone => {
+            start_node_no_peers(&mut Command::new(osmosisd), &osmosis_home)
+                .spawn()?
+                .wait()?;
+        }
     }
 
     Ok(())
+}
+
+fn start_node_no_peers<'a>(
+    osmosisd: &'a mut Command,
+    osmosis_home: &'a PathBuf,
+) -> &'a mut Command {
+    osmosisd
+        .arg("start")
+        .arg("--home")
+        .arg(&osmosis_home)
+        .arg("--p2p.persistent_peers")
+        .arg("")
+        .arg("--p2p.seeds")
+        .arg("")
+        .arg("--rpc.unsafe")
+        .arg("--grpc.enable")
+        .arg("--grpc-web.enable")
 }
 
 #[macro_export]
