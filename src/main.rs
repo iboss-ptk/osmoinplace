@@ -1,3 +1,5 @@
+#![doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))]
+
 use std::{
     io::{Seek, Write},
     path::PathBuf,
@@ -60,19 +62,27 @@ enum Commands {
         #[arg(long)]
         upgrade_handler: Option<String>,
 
-        /// Upgraded binary used to start the chain with upgrade handler triggered
+        /// New osmosisd binary to use to run the upgrade
         #[arg(long)]
-        upgraded_binary: Option<PathBuf>,
+        new_osmosisd_bin: Option<PathBuf>,
+
+        /// Command to run on first indexed block events
+        #[arg(long)]
+        on_ready: Option<String>,
     },
 
     /// Start a standalone node
-    StartStandalone,
+    StartStandalone {
+        /// Command to run on first indexed block events
+        #[arg(long)]
+        on_ready: Option<String>,
+    },
 
     /// Magic start command to perform all setup at once
     MagicStart {
         /// Determine whether to download new snapshot or restore from backup
         #[arg(long, default_value = "false")]
-        download: bool,
+        download_mainnet_state: bool,
 
         /// Path to backup directory, defaults to $HOME/.osmosisd_bak
         #[arg(long)]
@@ -85,6 +95,10 @@ enum Commands {
         /// New osmosisd binary to use to run the upgrade
         #[arg(long)]
         new_osmosisd_bin: Option<PathBuf>,
+
+        /// Command to run on first indexed block events
+        #[arg(long)]
+        on_ready: Option<String>,
     },
 }
 
@@ -127,21 +141,27 @@ async fn run_cmd(cli: Cli) -> Result<()> {
         }
         Commands::StartInPlaceTestnet {
             upgrade_handler,
-            upgraded_binary,
+            new_osmosisd_bin,
+            on_ready,
         } => {
-            start_in_place_testnet(&osmosisd, &osmosis_home, upgrade_handler, upgraded_binary)
-                .await?
+            start_in_place_testnet(
+                &osmosisd,
+                &osmosis_home,
+                upgrade_handler,
+                new_osmosisd_bin,
+                on_ready.clone(),
+            )
+            .await?
         }
-        Commands::StartStandalone => {
-            start_node_no_peers(&mut Command::new(osmosisd), &osmosis_home)
-                .spawn()?
-                .wait()?;
+        Commands::StartStandalone { on_ready } => {
+            start_standalone(&osmosisd, &osmosis_home, on_ready.clone())?
         }
         Commands::MagicStart {
-            download,
+            download_mainnet_state: download,
             backup_path,
             upgrade_handler,
             new_osmosisd_bin,
+            on_ready,
         } => {
             if *download {
                 download_mainnet_state(&osmosisd, &osmosis_home).await?;
@@ -153,8 +173,14 @@ async fn run_cmd(cli: Cli) -> Result<()> {
             start_sync(&osmosisd, &osmosis_home, true).await?;
 
             // start the node
-            start_in_place_testnet(&osmosisd, &osmosis_home, upgrade_handler, new_osmosisd_bin)
-                .await?;
+            start_in_place_testnet(
+                &osmosisd,
+                &osmosis_home,
+                upgrade_handler,
+                new_osmosisd_bin,
+                on_ready.clone(),
+            )
+            .await?;
         }
     }
 
@@ -358,6 +384,7 @@ async fn start_in_place_testnet(
     osmosis_home: &PathBuf,
     upgrade_handler: &Option<String>,
     new_osmosisd_bin: &Option<PathBuf>,
+    on_ready: Option<String>,
 ) -> Result<()> {
     let mut cmd = Command::new(osmosisd);
     cmd.arg("in-place-testnet")
@@ -374,12 +401,28 @@ async fn start_in_place_testnet(
 
     let mut child = cmd.spawn()?;
 
+    let mut on_ready_executed = false;
+
     if let Some(stdout) = child.stdout.as_mut() {
         use std::io::BufRead;
         let reader = std::io::BufReader::new(stdout);
         for line in reader.lines() {
             let line = line?;
             println!("{}", line);
+
+            if let Some(ref on_ready) = on_ready {
+                // on_ready only execute here if there is no upgrade_handler, if there is, it will be executed in `start_standalone`
+                if upgrade_handler.is_none() && !on_ready_executed {
+                    let status = Command::new("sh").arg("-c").arg(on_ready).spawn()?.wait()?;
+
+                    if !status.success() {
+                        return Err(eyre!("Failed to execute on_ready command"));
+                    }
+
+                    on_ready_executed = true;
+                }
+            }
+
             if line.contains("CONSENSUS FAILURE!!!") {
                 child.kill()?;
                 break;
@@ -390,13 +433,44 @@ async fn start_in_place_testnet(
     child.wait()?;
 
     if let Some(new_osmosisd_bin) = new_osmosisd_bin {
-        start_node_no_peers(
-            &mut Command::new(new_osmosisd_bin.as_os_str()),
-            &osmosis_home,
-        )
-        .spawn()?
-        .wait()?;
+        start_standalone(new_osmosisd_bin, osmosis_home, on_ready)?;
     }
+
+    Ok(())
+}
+
+fn start_standalone(
+    osmosisd: &PathBuf,
+    osmosis_home: &PathBuf,
+    on_ready: Option<String>,
+) -> Result<()> {
+    let mut child = start_node_no_peers(&mut Command::new(osmosisd), &osmosis_home)
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+
+    let mut on_ready_executed = false;
+
+    if let Some(stdout) = child.stdout.as_mut() {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = line?;
+            println!("{}", line);
+            if let Some(ref on_ready) = on_ready {
+                if !on_ready_executed && line.contains("indexed block events") {
+                    let status = Command::new("sh").arg("-c").arg(on_ready).spawn()?.wait()?;
+
+                    if !status.success() {
+                        return Err(eyre!("Failed to execute on_ready command"));
+                    }
+
+                    on_ready_executed = true;
+                }
+            }
+        }
+    }
+
+    child.wait()?;
 
     Ok(())
 }
