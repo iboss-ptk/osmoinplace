@@ -1,5 +1,6 @@
 [package]
 authors = ["Boss <supanat.ptk@gmail.com"]
+description = "Utility for setting up osmosis in-place testnet for development and testing."
 edition = "2021"
 license = "MIT OR Apache-2.0"
 name = "osmoinplace"
